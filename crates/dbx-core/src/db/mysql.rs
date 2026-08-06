@@ -3996,6 +3996,37 @@ pub async fn execute_query_with_max_rows(
     execute_query_on_conn_with_max_rows(&mut conn, sql, bare, max_rows, dialect).await
 }
 
+/// Execute `sql` with `FOREIGN_KEY_CHECKS` disabled for the duration of the
+/// statement. The session variable and the statement run on the SAME checked-out
+/// connection so the setting reliably applies regardless of which pool connection
+/// is handed out. Foreign key checks are restored before the connection is
+/// returned to the pool, so the change never leaks to other queries.
+pub async fn execute_query_with_foreign_keys_disabled(
+    pool: &MySqlPool,
+    sql: &str,
+    bare: bool,
+    max_rows: Option<usize>,
+    dialect: MySqlQueryDialect,
+) -> Result<QueryResult, String> {
+    let mut conn = get_conn_with_health_check(pool).await?;
+    execute_query_on_conn_with_max_rows(&mut conn, "SET FOREIGN_KEY_CHECKS = 0", bare, max_rows, dialect)
+        .await
+        .map_err(|e| format!("Failed to disable FOREIGN_KEY_CHECKS: {e}"))?;
+    let result = execute_query_on_conn_with_max_rows(&mut conn, sql, bare, max_rows, dialect).await;
+    let restore =
+        execute_query_on_conn_with_max_rows(&mut conn, "SET FOREIGN_KEY_CHECKS = 1", bare, max_rows, dialect).await;
+    match (result, restore) {
+        (Ok(result), Ok(_)) => Ok(result),
+        (Err(error), Ok(_)) => Err(error),
+        (Ok(_), Err(restore_error)) => {
+            Err(format!("Statement succeeded but failed to restore FOREIGN_KEY_CHECKS: {restore_error}"))
+        }
+        (Err(error), Err(restore_error)) => {
+            Err(format!("{error}; also failed to restore FOREIGN_KEY_CHECKS: {restore_error}"))
+        }
+    }
+}
+
 pub async fn stream_query_rows(
     pool: &MySqlPool,
     sql: &str,

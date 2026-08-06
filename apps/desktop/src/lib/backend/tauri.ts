@@ -3376,6 +3376,7 @@ export interface TransferRequest {
   mode: TransferMode;
   targetTableNameCase: TransferTableNameCase;
   ownershipPolicy?: TransferOwnershipPolicy;
+  skipForeignKeys?: boolean;
   batchSize: number;
 }
 

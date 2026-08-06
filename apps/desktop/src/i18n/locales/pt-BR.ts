@@ -3872,6 +3872,8 @@ export default withEnglishFallback({
     tableNameCaseLower: "Converter para minúsculas",
     tableNameCaseUpper: "Converter para maiúsculas",
     batchSize: "Tamanho do lote",
+    skipForeignKeys: "Ignorar restrições de chave estrangeira durante a transferência",
+    skipForeignKeysHint: "As chaves estrangeiras são recriadas após a conclusão",
     start: "Iniciar transferência",
     cancel: "Cancelar",
     progress: "Transferindo...",

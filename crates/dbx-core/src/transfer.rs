@@ -181,6 +181,8 @@ pub struct TransferRequest {
     pub target_table_name_case: TransferTableNameCase,
     #[serde(default)]
     pub ownership_policy: TransferOwnershipPolicy,
+    #[serde(default)]
+    pub skip_foreign_keys: bool,
     pub batch_size: usize,
 }
 
@@ -695,6 +697,16 @@ pub fn validate_transfer_request(request: &TransferRequest) -> Result<(), String
 struct ResolvedTransferTargetTable {
     name: String,
     preexisting: bool,
+}
+
+/// Result of transferring a single table.
+#[derive(Debug, Clone, Default)]
+pub struct TransferTableOutcome {
+    pub rows: u64,
+    /// `ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY ...` statements to apply
+    /// on the target AFTER the whole transfer completes. Captured when
+    /// `skip_foreign_keys` created the target table without inline foreign keys.
+    pub mysql_fk_rebuild_ddl: Vec<String>,
 }
 
 fn json_scalar_to_string(value: &serde_json::Value) -> Option<String> {
@@ -1368,7 +1380,11 @@ async fn execute_transfer_write_statement(
     table: &str,
     schema: &str,
     needs_identity_insert: bool,
+    skip_foreign_keys: bool,
 ) -> Result<(), String> {
+    if skip_foreign_keys && is_mysql_family_target(target_db_type) {
+        return execute_mysql_transfer_write_ignoring_fks(state, target_pool_key, sql).await;
+    }
     if !needs_identity_insert || !matches!(target_db_type, DatabaseType::Dameng) {
         execute_on_pool(state, target_pool_key, sql).await?;
         return Ok(());
@@ -1392,6 +1408,32 @@ async fn execute_transfer_write_statement(
             Err(format!("{write_error}; also failed to disable Dameng IDENTITY_INSERT for {table}: {disable_error}"))
         }
     }
+}
+
+/// Execute a single target-side write on a pinned MySQL-family connection with
+/// `FOREIGN_KEY_CHECKS` disabled for the duration of the statement, so the
+/// write cannot be blocked by foreign key constraints (the session variable is
+/// restored before the connection returns to the pool).
+async fn execute_mysql_transfer_write_ignoring_fks(
+    state: &AppState,
+    target_pool_key: &str,
+    sql: &str,
+) -> Result<(), String> {
+    let (pool, bare) = {
+        let connections = state.connections.read().await;
+        match connections.get(target_pool_key) {
+            Some(PoolKind::Mysql(pool, mode)) => {
+                let pool = pool.clone();
+                let bare = *mode == crate::connection::MysqlMode::Bare;
+                (pool, bare)
+            }
+            _ => return Err("Target pool is not a MySQL-family pool".to_string()),
+        }
+    };
+    db::mysql::execute_query_with_foreign_keys_disabled(&pool, sql, bare, None, Default::default())
+        .await
+        .map_err(|e| format!("Failed to write while foreign key checks are disabled: {e}"))?;
+    Ok(())
 }
 
 fn rewrite_postgres_schema_qualified_references(input: &str, source_schema: &str, target_schema: &str) -> String {
@@ -1779,6 +1821,77 @@ fn generate_postgres_foreign_key_ddl(
             "ALTER TABLE {full_table} ADD CONSTRAINT {} FOREIGN KEY ({columns}) REFERENCES {referenced_table} ({ref_columns})",
             quote_identifier(name, &DatabaseType::Postgres)
         ));
+    }
+
+    statements
+}
+
+/// Generate `ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY ...` statements that
+/// re-create the source table's foreign keys on the target. The target table is
+/// created without inline FKs when `skip_foreign_keys` is enabled; these
+/// statements are applied after the whole transfer completes.
+fn generate_mysql_foreign_key_ddl(
+    foreign_keys: &[db::ForeignKeyInfo],
+    table: &str,
+    source_database: &str,
+    target_database: &str,
+    map_ref_table: impl Fn(&str) -> String,
+) -> Vec<String> {
+    fn mysql_qualified(table: &str, database: &str) -> String {
+        if database.trim().is_empty() {
+            quote_identifier(table, &DatabaseType::Mysql)
+        } else {
+            format!(
+                "{}.{}",
+                quote_identifier(database, &DatabaseType::Mysql),
+                quote_identifier(table, &DatabaseType::Mysql)
+            )
+        }
+    }
+
+    let full_table = mysql_qualified(table, target_database);
+    let mut grouped: HashMap<&str, Vec<&db::ForeignKeyInfo>> = HashMap::new();
+    let mut order = Vec::new();
+
+    for foreign_key in foreign_keys {
+        if !grouped.contains_key(foreign_key.name.as_str()) {
+            order.push(foreign_key.name.as_str());
+        }
+        grouped.entry(foreign_key.name.as_str()).or_default().push(foreign_key);
+    }
+
+    let mut statements = Vec::new();
+    for name in order {
+        let Some(group) = grouped.get(name) else {
+            continue;
+        };
+        let columns = group
+            .iter()
+            .map(|foreign_key| quote_identifier(&foreign_key.column, &DatabaseType::Mysql))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let ref_columns = group
+            .iter()
+            .map(|foreign_key| quote_identifier(&foreign_key.ref_column, &DatabaseType::Mysql))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let referenced_database = match group[0].ref_schema.as_deref() {
+            Some(ref_schema) if ref_schema == source_database => target_database,
+            Some(ref_schema) => ref_schema,
+            None => target_database,
+        };
+        let referenced_table = mysql_qualified(&map_ref_table(&group[0].ref_table), referenced_database);
+        let mut statement = format!(
+            "ALTER TABLE {full_table} ADD CONSTRAINT {} FOREIGN KEY ({columns}) REFERENCES {referenced_table} ({ref_columns})",
+            quote_identifier(name, &DatabaseType::Mysql)
+        );
+        if let Some(rule) = group[0].on_update.as_deref().filter(|rule| !rule.trim().is_empty()) {
+            statement.push_str(&format!(" ON UPDATE {}", rule.trim()));
+        }
+        if let Some(rule) = group[0].on_delete.as_deref().filter(|rule| !rule.trim().is_empty()) {
+            statement.push_str(&format!(" ON DELETE {}", rule.trim()));
+        }
+        statements.push(statement);
     }
 
     statements
@@ -3193,12 +3306,43 @@ fn rewrite_transfer_source_table_ddl(
     target_schema: &str,
     source_db_type: &DatabaseType,
     target_db_type: &DatabaseType,
+    skip_foreign_keys: bool,
 ) -> String {
-    if is_postgres_family_target(source_db_type) && is_postgres_family_target(target_db_type) {
+    let rewritten = if is_postgres_family_target(source_db_type) && is_postgres_family_target(target_db_type) {
         rewrite_postgres_schema_qualified_references(sql, source_schema, target_schema)
     } else {
         sql.to_string()
+    };
+    if skip_foreign_keys && is_mysql_family_target(target_db_type) {
+        sanitize_mysql_transfer_table_ddl(&rewritten)
+    } else {
+        rewritten
     }
+}
+
+/// Remove inline `CONSTRAINT ... FOREIGN KEY ...` clauses from a MySQL-family
+/// `CREATE TABLE` DDL (as produced by `SHOW CREATE TABLE`). Foreign keys are
+/// re-added by [`generate_mysql_foreign_key_ddl`] after the whole transfer
+/// completes, so the transient omission never blocks inserts.
+fn sanitize_mysql_transfer_table_ddl(sql: &str) -> String {
+    if !sql.trim_start().to_ascii_uppercase().starts_with("CREATE TABLE ") {
+        return sql.to_string();
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    for line in sql.lines() {
+        if line.to_ascii_uppercase().contains(" FOREIGN KEY ") {
+            if let Some(previous) = lines.last_mut() {
+                let trimmed_len = previous.trim_end_matches(char::is_whitespace).len();
+                if previous[..trimmed_len].ends_with(',') {
+                    previous.truncate(trimmed_len - 1);
+                }
+            }
+            continue;
+        }
+        lines.push(line.to_string());
+    }
+    lines.join("\n")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5528,7 +5672,7 @@ async fn transfer_mongodb_table<F>(
     source_pool_key: &str,
     target_pool_key: &str,
     mut progress_callback: F,
-) -> Result<u64, String>
+) -> Result<TransferTableOutcome, String>
 where
     F: FnMut(TransferProgress),
 {
@@ -5786,7 +5930,7 @@ where
         }
     }
 
-    Ok(total_transferred)
+    Ok(TransferTableOutcome { rows: total_transferred, ..Default::default() })
 }
 
 /// Transfer a single table. Returns rows transferred.
@@ -5802,7 +5946,7 @@ pub async fn transfer_table<F>(
     source_pool_key: &str,
     target_pool_key: &str,
     mut progress_callback: F,
-) -> Result<u64, String>
+) -> Result<TransferTableOutcome, String>
 where
     F: FnMut(TransferProgress),
 {
@@ -6062,6 +6206,7 @@ where
                         &request.target_schema,
                         source_db_type,
                         target_db_type,
+                        request.skip_foreign_keys,
                     )
                 }
             } else {
@@ -6110,10 +6255,43 @@ where
         }
     }
 
+    // When foreign keys are skipped, the target table was created without
+    // inline FOREIGN KEY clauses. Capture the source foreign keys now so the
+    // caller can re-add them on the target after the whole transfer completes.
+    let mut mysql_fk_rebuild_ddl = Vec::new();
+    if request.skip_foreign_keys
+        && request.create_table
+        && is_mysql_family_target(target_db_type)
+        && !target_table_preexisting
+    {
+        match crate::schema::list_foreign_keys_core(
+            state,
+            &request.source_connection_id,
+            &request.source_database,
+            &request.source_schema,
+            table,
+        )
+        .await
+        {
+            Ok(foreign_keys) => {
+                mysql_fk_rebuild_ddl = generate_mysql_foreign_key_ddl(
+                    &foreign_keys,
+                    &target_table,
+                    &request.source_database,
+                    &request.target_database,
+                    |ref_table| request.target_table_name(ref_table),
+                );
+            }
+            Err(e) => {
+                log::warn!("[transfer] failed to read foreign keys for {table}: {e}");
+            }
+        }
+    }
+
     // Structure-only transfer: DDL work (create table, indexes, comments) is
     // done above; skip everything data-related.
     if !should_copy_data(&request.content) {
-        return Ok(0);
+        return Ok(TransferTableOutcome { mysql_fk_rebuild_ddl, ..Default::default() });
     }
 
     // Truncate target if overwrite mode
@@ -6126,7 +6304,15 @@ where
             }
             _ => format!("TRUNCATE TABLE {full_table}"),
         };
-        execute_on_pool(state, target_pool_key, &truncate_sql).await.map_err(|e| format!("Failed to truncate: {e}"))?;
+        if request.skip_foreign_keys && is_mysql_family_target(target_db_type) {
+            execute_mysql_transfer_write_ignoring_fks(state, target_pool_key, &truncate_sql)
+                .await
+                .map_err(|e| format!("Failed to truncate: {e}"))?;
+        } else {
+            execute_on_pool(state, target_pool_key, &truncate_sql)
+                .await
+                .map_err(|e| format!("Failed to truncate: {e}"))?;
+        }
     }
 
     // Determine effective mode and PK columns for upsert
@@ -6226,6 +6412,7 @@ where
                 &target_table,
                 &request.target_schema,
                 writes_dameng_identity_columns,
+                request.skip_foreign_keys,
             )
             .await
             .map_err(|e| {
@@ -6292,7 +6479,26 @@ where
         }
     }
 
-    Ok(total_transferred)
+    Ok(TransferTableOutcome { rows: total_transferred, mysql_fk_rebuild_ddl })
+}
+
+/// Apply foreign key re-creation statements captured during a transfer that
+/// skipped foreign key constraints (see [`TransferTableOutcome::mysql_fk_rebuild_ddl`]).
+/// Runs after the whole transfer so every referenced table already exists.
+/// Returns one failure message per failed statement; empty when all succeeded.
+pub async fn apply_transfer_fk_rebuild_ddl(
+    state: &AppState,
+    target_pool_key: &str,
+    statements: &[String],
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    for statement in statements {
+        if let Err(e) = execute_on_pool(state, target_pool_key, statement).await {
+            log::warn!("[transfer] failed to re-add foreign key: {statement}: {e}");
+            failures.push(format!("{statement}: {e}"));
+        }
+    }
+    failures
 }
 
 pub async fn transfer_postgres_schema_dependencies<F>(
@@ -6888,12 +7094,14 @@ mod tests {
             mode: TransferMode::Append,
             target_table_name_case: TransferTableNameCase::Preserve,
             ownership_policy: TransferOwnershipPolicy::Preserve,
+            skip_foreign_keys: true,
             batch_size: 1000,
         };
         let json = serde_json::to_value(&request).unwrap();
         assert_eq!(json["content"], "structureOnly");
         assert_eq!(json["objects"][0]["objectType"], "VIEW");
         assert_eq!(json["objects"][0]["names"][0], "v1");
+        assert_eq!(json["skipForeignKeys"], true);
     }
 
     mod transfer_family_tests {
@@ -6959,6 +7167,7 @@ mod tests {
                 mode: TransferMode::Append,
                 target_table_name_case: TransferTableNameCase::Preserve,
                 ownership_policy: TransferOwnershipPolicy::Preserve,
+                skip_foreign_keys: false,
                 batch_size: 1000,
                 content: TransferContent::DataOnly,
                 objects: Vec::new(),
@@ -7403,6 +7612,83 @@ mod tests {
             let event = mysql_event_ddl("shop", "ev1", "ENABLE", "EVERY 1 DAY", "DELETE FROM logs");
             assert_eq!(event, "CREATE EVENT `ev1` ON SCHEDULE EVERY 1 DAY ENABLE DO DELETE FROM logs");
         }
+
+        #[test]
+        fn strips_inline_foreign_keys_from_reused_table_ddl() {
+            let ddl = "CREATE TABLE `orders` (\n  `id` bigint NOT NULL,\n  `user_id` bigint NOT NULL,\n  PRIMARY KEY (`id`),\n  CONSTRAINT `orders_user_fk` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`) ON DELETE CASCADE\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+
+            let sanitized = sanitize_mysql_transfer_table_ddl(ddl);
+
+            assert!(!sanitized.contains("FOREIGN KEY"), "{sanitized}");
+            assert!(!sanitized.contains("orders_user_fk"), "{sanitized}");
+            assert!(sanitized.contains("`id` bigint NOT NULL"), "{sanitized}");
+            assert!(sanitized.contains("`user_id` bigint NOT NULL"), "{sanitized}");
+            assert!(sanitized.contains("PRIMARY KEY (`id`)"), "{sanitized}");
+            assert!(sanitized.ends_with(") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"), "{sanitized}");
+            // Previous line's trailing comma is removed so the DDL stays valid.
+            assert!(!sanitized.contains("(`id`),\n)"), "{sanitized}");
+        }
+
+        #[test]
+        fn leaves_non_create_table_mysql_ddl_unchanged() {
+            let view = "CREATE VIEW `v` AS SELECT 1";
+            assert_eq!(sanitize_mysql_transfer_table_ddl(view), view);
+        }
+
+        #[test]
+        fn generates_mysql_foreign_key_rebuild_ddl() {
+            let fks = vec![
+                db::ForeignKeyInfo {
+                    name: "orders_user_fk".to_string(),
+                    column: "user_id".to_string(),
+                    ref_schema: Some("src".to_string()),
+                    ref_table: "users".to_string(),
+                    ref_column: "id".to_string(),
+                    on_update: Some("CASCADE".to_string()),
+                    on_delete: Some("RESTRICT".to_string()),
+                },
+                db::ForeignKeyInfo {
+                    name: "orders_user_fk".to_string(),
+                    column: "tenant_id".to_string(),
+                    ref_schema: Some("src".to_string()),
+                    ref_table: "users".to_string(),
+                    ref_column: "tenant_id".to_string(),
+                    on_update: Some("CASCADE".to_string()),
+                    on_delete: Some("RESTRICT".to_string()),
+                },
+            ];
+
+            let statements = generate_mysql_foreign_key_ddl(&fks, "orders", "src", "dst", |table| table.to_string());
+
+            assert_eq!(
+                statements,
+                vec![
+                    "ALTER TABLE `dst`.`orders` ADD CONSTRAINT `orders_user_fk` FOREIGN KEY (`user_id`, `tenant_id`) REFERENCES `dst`.`users` (`id`, `tenant_id`) ON UPDATE CASCADE ON DELETE RESTRICT"
+                ]
+            );
+        }
+
+        #[test]
+        fn mysql_foreign_key_rebuild_ddl_maps_referenced_table_name_case() {
+            let fks = vec![db::ForeignKeyInfo {
+                name: "orders_user_fk".to_string(),
+                column: "user_id".to_string(),
+                ref_schema: Some("src".to_string()),
+                ref_table: "users".to_string(),
+                ref_column: "id".to_string(),
+                on_update: None,
+                on_delete: None,
+            }];
+
+            let statements = generate_mysql_foreign_key_ddl(&fks, "orders", "src", "dst", |table| table.to_uppercase());
+
+            assert_eq!(
+                statements,
+                vec![
+                    "ALTER TABLE `dst`.`orders` ADD CONSTRAINT `orders_user_fk` FOREIGN KEY (`user_id`) REFERENCES `dst`.`USERS` (`id`)"
+                ]
+            );
+        }
     }
 
     mod transfer_sqlserver_source_tests {
@@ -7648,6 +7934,7 @@ mod tests {
             mode: TransferMode::Append,
             target_table_name_case: TransferTableNameCase::Preserve,
             ownership_policy: TransferOwnershipPolicy::Preserve,
+            skip_foreign_keys: false,
             batch_size: 1000,
         }
     }
@@ -8278,8 +8565,14 @@ mod tests {
         let ddl =
             "CREATE TABLE \"src\".\"items\" (\"id\" integer);\nCOMMENT ON COLUMN \"src\".\"items\".\"id\" IS 'id';";
 
-        let rewritten =
-            rewrite_transfer_source_table_ddl(ddl, "src", "dst", &DatabaseType::Postgres, &DatabaseType::Postgres);
+        let rewritten = rewrite_transfer_source_table_ddl(
+            ddl,
+            "src",
+            "dst",
+            &DatabaseType::Postgres,
+            &DatabaseType::Postgres,
+            false,
+        );
 
         assert!(rewritten.contains("CREATE TABLE \"dst\".\"items\""));
         assert!(rewritten.contains("COMMENT ON COLUMN \"dst\".\"items\".\"id\""));
@@ -8761,6 +9054,7 @@ mod tests {
             "archive",
             &DatabaseType::Postgres,
             &DatabaseType::Postgres,
+            false,
         );
         let sequence = PostgresOwnedSequence {
             name: "it_quick_entry_id_seq".to_string(),

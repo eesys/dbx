@@ -4064,6 +4064,8 @@ export default {
     tableNameCaseLower: "Lowercase",
     tableNameCaseUpper: "Uppercase",
     batchSize: "Batch size",
+    skipForeignKeys: "Ignore foreign key constraints during transfer",
+    skipForeignKeysHint: "FKs are re-created after the transfer completes",
     start: "Start Transfer",
     cancel: "Cancel",
     progress: "Transferring...",

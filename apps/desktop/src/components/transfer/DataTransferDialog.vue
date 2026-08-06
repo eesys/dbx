@@ -136,6 +136,7 @@ const pendingTargetSchemaPrefill = ref("");
 // Options
 const transferMode = ref<TransferMode>("append");
 const targetTableNameCase = ref<TransferTableNameCase>("preserve");
+const skipForeignKeys = ref(false);
 const batchSize = ref(1000);
 const isSubmitting = ref(false);
 const ownershipDialogOpen = ref(false);
@@ -500,6 +501,7 @@ function resetState() {
   transferContent.value = "structureAndData";
   transferMode.value = "append";
   targetTableNameCase.value = "preserve";
+  skipForeignKeys.value = false;
   batchSize.value = 1000;
   isSubmitting.value = false;
   ownershipDialogOpen.value = false;
@@ -537,6 +539,7 @@ async function startTransfer() {
     mode: transferMode.value,
     targetTableNameCase: targetTableNameCase.value,
     ownershipPolicy: "preserve",
+    skipForeignKeys: skipForeignKeys.value,
     batchSize: batchSize.value,
   };
 
@@ -834,6 +837,11 @@ function getConnectionName(id: string) {
               <Label class="text-xs shrink-0">{{ t("transfer.batchSize") }}</Label>
               <Input v-model.number="batchSize" type="number" min="100" max="10000" step="100" class="h-7 text-xs w-24" />
             </div>
+            <label class="flex cursor-pointer items-center gap-2 text-xs">
+              <input type="checkbox" v-model="skipForeignKeys" class="h-3.5 w-3.5" />
+              <span>{{ t("transfer.skipForeignKeys") }}</span>
+              <span class="text-muted-foreground/70">{{ t("transfer.skipForeignKeysHint") }}</span>
+            </label>
           </div>
         </div>
       </div>

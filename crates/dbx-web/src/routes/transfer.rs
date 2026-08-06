@@ -198,6 +198,7 @@ pub async fn start_transfer(
             }
         };
         let mut failed_tables: Vec<String> = Vec::new();
+        let mut fk_rebuild_ddl: Vec<String> = Vec::new();
 
         if matches!(source_db_type, dbx_core::models::connection::DatabaseType::Postgres)
             && matches!(target_db_type, dbx_core::models::connection::DatabaseType::Postgres)
@@ -289,14 +290,15 @@ pub async fn start_transfer(
             .await;
 
             match result {
-                Ok(rows) => {
+                Ok(outcome) => {
+                    fk_rebuild_ddl.extend(outcome.mysql_fk_rebuild_ddl);
                     let progress = transfer::TransferProgress {
                         transfer_id: req.transfer_id.clone(),
                         table: table.clone(),
                         table_index: i,
                         total_tables: tables.len(),
-                        rows_transferred: rows,
-                        total_rows: last_total_rows.or(Some(rows)),
+                        rows_transferred: outcome.rows,
+                        total_rows: last_total_rows.or(Some(outcome.rows)),
                         status: TransferStatus::TableDone,
                         error: None,
                         terminal: false,
@@ -388,6 +390,12 @@ pub async fn start_transfer(
         // Send done
         if !object_outcome.failed.is_empty() {
             failed_tables.push(format!("schema objects ({})", object_outcome.failed.len()));
+        }
+        if !fk_rebuild_ddl.is_empty() {
+            let fk_failures = transfer::apply_transfer_fk_rebuild_ddl(&app, &target_pool_key, &fk_rebuild_ddl).await;
+            if !fk_failures.is_empty() {
+                failed_tables.push(format!("foreign keys ({})", fk_failures.len()));
+            }
         }
         let skip_suffix = if !object_outcome.skipped.is_empty() && failed_tables.is_empty() {
             format!("，跳过 {} 个已存在对象", object_outcome.skipped.len())
@@ -610,6 +618,7 @@ mod tests {
             mode: TransferMode::Append,
             target_table_name_case: TransferTableNameCase::Preserve,
             ownership_policy: TransferOwnershipPolicy::Preserve,
+            skip_foreign_keys: false,
             batch_size: 1000,
         }
     }

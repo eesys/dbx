@@ -3607,6 +3607,8 @@ export default withEnglishFallback({
     tableNameCaseLower: "소문자",
     tableNameCaseUpper: "대문자",
     batchSize: "배치 크기",
+    skipForeignKeys: "전송 중 외래 키 제약 무시",
+    skipForeignKeysHint: "전송 완료 후 외래 키가 다시 생성됩니다",
     start: "이전 시작",
     cancel: "취소",
     progress: "이전 중...",

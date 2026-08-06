@@ -3870,6 +3870,8 @@ export default withEnglishFallback({
     tableNameCaseLower: "Converti in minuscolo",
     tableNameCaseUpper: "Converti in maiuscolo",
     batchSize: "Dimensione lotto",
+    skipForeignKeys: "Ignora i vincoli di chiave esterna durante il trasferimento",
+    skipForeignKeysHint: "Le chiavi esterne vengono ricreate al termine",
     start: "Avvia Trasferimento",
     cancel: "Annulla",
     progress: "Trasferimento in corso...",

@@ -1366,6 +1366,7 @@ async fn live_sqlserver_transfer_table_skips_rowversion_insert_column() {
         mode: dbx_core::transfer::TransferMode::Append,
         target_table_name_case: dbx_core::transfer::TransferTableNameCase::Upper,
         ownership_policy: dbx_core::transfer::TransferOwnershipPolicy::Preserve,
+        skip_foreign_keys: false,
         batch_size: 100,
     };
     let result = dbx_core::transfer::transfer_table(
@@ -1388,7 +1389,7 @@ async fn live_sqlserver_transfer_table_skips_rowversion_insert_column() {
     let _ = dbx_core::db::sqlserver::execute_batch(&mut setup_client, &cleanup_source).await;
     let _ = std::fs::remove_dir_all(&dir);
 
-    assert_eq!(result.expect("transfer rowversion table"), 2);
+    assert_eq!(result.expect("transfer rowversion table").rows, 2);
     let verify_result = verify_result.expect("verify target rowversion rows");
     assert_eq!(verify_result.rows[0][0], serde_json::json!(2));
     assert_eq!(verify_result.rows[0][1], serde_json::json!(2));

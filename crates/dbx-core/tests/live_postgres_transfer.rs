@@ -223,6 +223,7 @@ async fn live_postgres_transfer_preserves_data_and_schema_objects() {
         mode: TransferMode::Append,
         target_table_name_case: TransferTableNameCase::Preserve,
         ownership_policy: TransferOwnershipPolicy::Preserve,
+        skip_foreign_keys: false,
         batch_size: 100,
     };
 
@@ -508,6 +509,7 @@ async fn live_postgres_transfer_skips_create_ddl_for_existing_target_table() {
         mode: TransferMode::Append,
         target_table_name_case: TransferTableNameCase::Preserve,
         ownership_policy: TransferOwnershipPolicy::Preserve,
+        skip_foreign_keys: false,
         batch_size: 100,
     };
 
@@ -527,7 +529,7 @@ async fn live_postgres_transfer_skips_create_ddl_for_existing_target_table() {
     .await
     .unwrap();
 
-    assert_eq!(transferred, 1);
+    assert_eq!(transferred.rows, 1);
     assert_eq!(
         query_scalar(&target_pool, &format!("SELECT \"name\" FROM \"{}\".\"items\" WHERE \"id\" = 1", target_schema))
             .await,

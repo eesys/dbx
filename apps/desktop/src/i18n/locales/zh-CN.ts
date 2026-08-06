@@ -4063,6 +4063,8 @@ export default withEnglishFallback({
     tableNameCaseLower: "转为小写",
     tableNameCaseUpper: "转为大写",
     batchSize: "每批行数",
+    skipForeignKeys: "传输时忽略外键约束",
+    skipForeignKeysHint: "传输完成后将自动重建外键",
     start: "开始传输",
     cancel: "取消",
     progress: "传输中...",

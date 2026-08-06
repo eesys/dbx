@@ -3902,6 +3902,8 @@ export default withEnglishFallback({
     tableNameCaseLower: "小文字に変換",
     tableNameCaseUpper: "大文字に変換",
     batchSize: "バッチサイズ",
+    skipForeignKeys: "転送中は外部キー制約を無視する",
+    skipForeignKeysHint: "転送完了後に外部キーを再作成します",
     start: "転送開始",
     cancel: "キャンセル",
     progress: "転送中...",

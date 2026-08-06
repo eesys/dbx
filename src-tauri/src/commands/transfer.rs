@@ -98,6 +98,7 @@ pub async fn start_transfer(
         let mut failed_tables: Vec<String> = Vec::new();
         let mut last_rows_transferred = 0_u64;
         let mut last_total_rows = None;
+        let mut fk_rebuild_ddl: Vec<String> = Vec::new();
 
         if matches!(source_db_type, dbx_core::models::connection::DatabaseType::Postgres)
             && matches!(target_db_type, dbx_core::models::connection::DatabaseType::Postgres)
@@ -193,7 +194,8 @@ pub async fn start_transfer(
             )
             .await
             {
-                Ok(rows) => {
+                Ok(outcome) => {
+                    fk_rebuild_ddl.extend(outcome.mysql_fk_rebuild_ddl);
                     emit_progress(
                         &app,
                         TransferProgress {
@@ -201,8 +203,8 @@ pub async fn start_transfer(
                             table: table.clone(),
                             table_index: i,
                             total_tables,
-                            rows_transferred: rows,
-                            total_rows: last_total_rows.or(Some(rows)),
+                            rows_transferred: outcome.rows,
+                            total_rows: last_total_rows.or(Some(outcome.rows)),
                             status: TransferStatus::TableDone,
                             error: None,
                             terminal: false,
@@ -303,6 +305,13 @@ pub async fn start_transfer(
         }
         if !object_outcome.failed.is_empty() {
             failed_tables.push(format!("schema objects ({})", object_outcome.failed.len()));
+        }
+        if !fk_rebuild_ddl.is_empty() {
+            let fk_failures =
+                dbx_core::transfer::apply_transfer_fk_rebuild_ddl(&state, &target_pool_key, &fk_rebuild_ddl).await;
+            if !fk_failures.is_empty() {
+                failed_tables.push(format!("foreign keys ({})", fk_failures.len()));
+            }
         }
         let skip_suffix = if !object_outcome.skipped.is_empty() && failed_tables.is_empty() {
             format!("，跳过 {} 个已存在对象", object_outcome.skipped.len())

@@ -41,6 +41,14 @@ describe("DataTransferDialog transfer prefill", () => {
     expect(dialogSource).toContain('createTable: transferContent.value !== "dataOnly"');
   });
 
+  it("offers and sends the ignore foreign keys option", () => {
+    expect(dialogSource).toContain("const skipForeignKeys = ref(false);");
+    expect(dialogSource).toContain('v-model="skipForeignKeys"');
+    expect(dialogSource).toContain("skipForeignKeys: skipForeignKeys.value,");
+    expect(dialogSource).toContain("skipForeignKeys.value = false;");
+    expect(dialogSource).toContain('t("transfer.skipForeignKeys")');
+  });
+
   it("loads non-table object groups per source database kind", () => {
     expect(dialogSource).toContain("transferObjectKindsForDatabase");
     expect(dialogSource).toContain("api.listObjects(sourceConnectionId.value, sourceDatabase.value, schema, [kind]");
