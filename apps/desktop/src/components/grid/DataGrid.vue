@@ -142,7 +142,7 @@ import { dataGridHeaderContentWidth, scrollbarGutterWidth } from "@/lib/dataGrid
 import { canFetchNextDataGridSegment, canGoNextDataGridPage, dataGridTotalRowCountLabelKey, dataGridTruncationHintKey, hasCompleteLocalDataGridResult, resolveDataGridPaginationTotal, type DataGridInexactTotalRowCountMode } from "@/lib/dataGrid/dataGridPagination";
 import { dataGridCountQueryOptions } from "@/lib/dataGrid/dataGridQueryOptions";
 import { dataGridBottomScrollTop, dataGridScrollPosition, isDataGridAtScrollBottom, isDataGridNearScrollBottom, isDataGridPrefixAppend, shouldCheckInfiniteScrollAfterScroll, type DataGridScrollPosition } from "@/lib/dataGrid/dataGridInfiniteScroll";
-import { CANVAS_DATA_GRID_ROW_HEIGHT, canvasDataGridActionOverlayWidth, canvasDataGridActionReservedWidth, dataGridSearchMatchKey, drawCanvasDataGrid, type CanvasDevicePixelSize } from "@/lib/dataGrid/canvasDataGridRenderer";
+import { CANVAS_DATA_GRID_ROW_HEIGHT, MAX_CANVAS_DATA_GRID_PIXEL_RATIO, canvasDataGridActionOverlayWidth, canvasDataGridActionReservedWidth, dataGridSearchMatchKey, drawCanvasDataGrid, type CanvasDevicePixelSize } from "@/lib/dataGrid/canvasDataGridRenderer";
 import { DATA_GRID_DARK_STRIPED_ROW_BG, DATA_GRID_LIGHT_STRIPED_ROW_BG, dataGridActiveRowBackground } from "@/lib/dataGrid/dataGridPaintTheme";
 import { createRowLowerTextCache } from "@/lib/dataGrid/dataGridRowLowerText";
 import { dataGridPreviewLabelKey, dataGridSaveActionMode, dataGridSaveToolbarState } from "@/lib/dataGrid/dataGridSaveUi";
@@ -230,6 +230,7 @@ import { getTableMetadataCapabilities } from "@/lib/table/tableMetadataCapabilit
 import { getTableStructureCapabilities } from "@/lib/table/tableStructureCapabilities";
 import { filterObjectBrowserTableColumns } from "@/lib/table/objectBrowserTableInfo";
 import { reserveDataGridHeaderLine } from "@/lib/dataGrid/dataGridHeaderLayout";
+import { buildColumnIndexMap, columnIndexMetadataRequestCurrent, columnIndexNameKey, columnIndexTableIdentity } from "@/lib/dataGrid/dataGridColumnIndexIcon";
 import { supportsTableStructureEditing } from "@/lib/database/databaseCapabilities";
 import { rememberDataGridConditionHistory } from "@/lib/dataGrid/dataGridConditionHistory";
 import { restoreDataGridLocalColumnFilters, serializeDataGridLocalColumnFilters } from "@/lib/dataGrid/dataGridLocalColumnFilterState";
@@ -495,6 +496,15 @@ const dataGridTopbarWidth = ref(0);
 const dataGridViewportWidth = ref(0);
 const showColumnCommentsInHeader = computed(() => settingsStore.editorSettings.showColumnCommentsInHeader);
 const showColumnTypesInHeader = computed(() => settingsStore.editorSettings.showColumnTypesInHeader);
+const showIndexIndicatorsInHeader = computed(() => settingsStore.editorSettings.showIndexIndicatorsInHeader !== false);
+const primaryKeyColumnNames = computed(() => {
+  const names = new Set(props.tableMeta?.primaryKeys ?? []);
+  for (const column of props.tableMeta?.columns ?? []) {
+    if (column.is_primary_key) names.add(column.name);
+  }
+  return [...names];
+});
+const columnIndexMap = computed(() => buildColumnIndexMap(indexes.value, primaryKeyColumnNames.value));
 const compactColumnHeaderActions = computed(() => settingsStore.editorSettings.compactColumnHeaderActions);
 const dataGridRenderMode = computed(() => settingsStore.editorSettings.dataGridRenderMode);
 const dataGridSearchMode = computed(() => settingsStore.editorSettings.dataGridSearchMode);
@@ -2543,6 +2553,11 @@ const canGoNextPage = computed(() => {
     allRowsLoaded: allRowsLoaded.value,
   });
 });
+const maximumPage = computed(() => {
+  const total = hasKnownPaginationTotalRowCount.value ? paginationTotalRowCount.value : allRowsLoaded.value ? props.result.rows.length : undefined;
+  if (typeof total === "number" && Number.isFinite(total) && total >= 0) return Math.max(1, Math.ceil(total / pageSize.value));
+  return canGoNextPage.value ? undefined : currentPage.value;
+});
 const canFetchNextInfiniteScrollSegment = computed(() =>
   canFetchNextDataGridSegment({
     hasMore: props.result.has_more,
@@ -2711,6 +2726,21 @@ function nextPage() {
   currentPage.value++;
   resetGridVerticalScroll(true);
   emit("paginate", (currentPage.value - 1) * pageSize.value, pageSize.value, currentWhereInput(), currentOrderBy());
+}
+
+function jumpPage(page: number) {
+  if (gridSurfaceBusy.value || infiniteScrollEnabled.value || !Number.isSafeInteger(page) || page < 1) return;
+  const targetPage = Math.min(page, maximumPage.value ?? page);
+  if (targetPage === currentPage.value) return;
+  if (allRowsLoaded.value) {
+    currentPage.value = targetPage;
+    resetGridVerticalScroll(true);
+    return;
+  }
+  const offset = (targetPage - 1) * pageSize.value;
+  if (!Number.isSafeInteger(offset)) return;
+  resetGridVerticalScroll(true);
+  emit("paginate", offset, pageSize.value, currentWhereInput(), currentOrderBy());
 }
 
 function infiniteScrollNextPage() {
@@ -4755,7 +4785,7 @@ const canvasScrollTop = ref(0);
 const canvasHoverCell = ref<{ rowIndex: number; visibleColIdx: number } | null>(null);
 const canvasDevicePixelRatio = ref(typeof window === "undefined" ? 1 : window.devicePixelRatio || 1);
 const canvasMeasuredDevicePixelSize = ref<CanvasDevicePixelSize | null>(null);
-const canvasBackingPixelRatio = computed(() => Math.min(4, Math.max(1, canvasDevicePixelRatio.value * settingsStore.editorSettings.uiScale)));
+const canvasBackingPixelRatio = computed(() => Math.min(MAX_CANVAS_DATA_GRID_PIXEL_RATIO, Math.max(1, canvasDevicePixelRatio.value * settingsStore.editorSettings.uiScale)));
 const useCanvasGridRows = computed(() => dataGridRenderMode.value === "canvas");
 const canvasContentHeight = computed(() => Math.max(1, displayRowCount.value * CANVAS_DATA_GRID_ROW_HEIGHT));
 // Clamp the sticky canvas/overlay to the content width. A viewport-wide sticky surface inflates the
@@ -7460,6 +7490,16 @@ const indexes = ref<IndexInfo[]>([]);
 const indexesLoaded = ref(false);
 const indexesLoading = ref(false);
 const indexesError = ref("");
+const currentIndexTableIdentity = computed(() =>
+  columnIndexTableIdentity({
+    connectionId: props.connectionId,
+    database: props.database,
+    catalog: props.tableMeta?.catalog,
+    schema: props.tableMeta?.schema,
+    tableName: props.tableMeta?.tableName,
+  }),
+);
+let indexesRequestGeneration = 0;
 const showDropMongoIndexConfirm = ref(false);
 const dropMongoIndexLoading = ref(false);
 const pendingDropMongoIndex = ref<IndexInfo | null>(null);
@@ -7653,16 +7693,26 @@ async function fetchDdl() {
 }
 
 async function fetchIndexes() {
-  if (!props.connectionId || !props.tableMeta || indexesLoaded.value || indexesLoading.value) return;
+  const requestIdentity = currentIndexTableIdentity.value;
+  if (!props.connectionId || !props.tableMeta || !canShowTableIndexes.value || !requestIdentity || indexesLoaded.value || indexesLoading.value) return;
+  const connectionId = props.connectionId;
+  const database = props.database || "";
+  const schema = props.tableMeta.schema || props.database || "";
+  const tableName = props.tableMeta.tableName;
+  const catalog = props.tableMeta.catalog;
+  const requestGeneration = ++indexesRequestGeneration;
   indexesLoading.value = true;
   indexesError.value = "";
   try {
-    indexes.value = await api.listIndexes(props.connectionId, props.database || "", props.tableMeta.schema || props.database || "", props.tableMeta.tableName, props.tableMeta.catalog);
+    const nextIndexes = await api.listIndexes(connectionId, database, schema, tableName, catalog);
+    if (!columnIndexMetadataRequestCurrent({ requestGeneration, currentGeneration: indexesRequestGeneration, requestIdentity, currentIdentity: currentIndexTableIdentity.value })) return;
+    indexes.value = nextIndexes;
     indexesLoaded.value = true;
   } catch (e: any) {
+    if (!columnIndexMetadataRequestCurrent({ requestGeneration, currentGeneration: indexesRequestGeneration, requestIdentity, currentIdentity: currentIndexTableIdentity.value })) return;
     indexesError.value = String(e?.message || e);
   } finally {
-    indexesLoading.value = false;
+    if (columnIndexMetadataRequestCurrent({ requestGeneration, currentGeneration: indexesRequestGeneration, requestIdentity, currentIdentity: currentIndexTableIdentity.value })) indexesLoading.value = false;
   }
 }
 
@@ -7728,7 +7778,9 @@ watch(
     ddlContent.value = "";
     indexes.value = [];
     indexesLoaded.value = false;
+    indexesLoading.value = false;
     indexesError.value = "";
+    indexesRequestGeneration += 1;
     foreignKeys.value = [];
     foreignKeysLoaded.value = false;
     foreignKeysLoading.value = false;
@@ -7739,6 +7791,14 @@ watch(
     triggersError.value = "";
     if (showTableInfo.value) selectTableInfoTab(activeTableInfoTab.value);
   },
+);
+
+watch(
+  () => [showIndexIndicatorsInHeader.value, canShowTableIndexes.value, currentIndexTableIdentity.value] as const,
+  ([showIndicators, canShowIndexes, tableIdentity]) => {
+    if (showIndicators && canShowIndexes && tableIdentity) void fetchIndexes();
+  },
+  { immediate: true },
 );
 
 // ---- 外键单元格跳转 ----
@@ -8921,6 +8981,11 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                     :column-name-label="t('grid.columnName')"
                     :column-type-label="t('grid.columnType')"
                     :column-comment-label="t('grid.columnComment')"
+                    :column-index-label="t('grid.tableInfoIndexes')"
+                    :column-primary-index-label="t('grid.columnPrimaryIndex')"
+                    :column-unique-index-label="t('grid.columnUniqueIndex')"
+                    :column-regular-index-label="t('grid.columnRegularIndex')"
+                    :column-index-kind="showIndexIndicatorsInHeader ? columnIndexMap.get(columnIndexNameKey(col.name)) : undefined"
                     @pointerdown="startColumnHeaderDrag(col.visibleColIdx, $event)"
                     @click-capture="onHeaderClickCapture"
                     @click="onHeaderClick(col.visibleColIdx, $event)"
@@ -10014,6 +10079,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
         :page-size-menu-items="pageSizeMenuItems"
         :export-menu-items="exportMenuItems"
         :current-page="currentPage"
+        :max-page="maximumPage"
         :can-go-next-page="canGoNextPage"
         :can-jump-last-page="canJumpLastPage"
         @select-page-size="selectPageSizeMenuItem"
@@ -10021,6 +10087,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
         @first-page="firstPage"
         @previous-page="prevPage"
         @next-page="nextPage"
+        @jump-page="jumpPage"
         @last-page="lastPage"
         @select-export="selectExportMenuItem"
       />
